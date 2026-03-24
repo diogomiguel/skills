@@ -56,19 +56,7 @@ grep -r "resetMappings\|resetMappingsInHook" tests/
 Confirm any remaining hits are only inside the `WireMock` class definition itself
 (the deprecated static methods), not in any spec or stub helper.
 
-### 5. Check tsconfig if path aliases are introduced
-
-If the fix adds an import that uses a path alias (`@config`, `@resources`, etc.),
-check whether the spec file is listed in the `files` array of `tsconfig.json`.
-If not, add it — otherwise the alias will fail to resolve at type-check time.
-
-### 6. Smoke-check imports compile
-
-```bash
-npx tsc --noEmit
-```
-
-Fix any type errors before finishing.
+Utility soon to be deleted.
 
 ## Reference
 
