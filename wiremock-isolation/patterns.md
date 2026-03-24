@@ -184,12 +184,56 @@ await deleteMenuItem.click()
 
 ---
 
+---
+
+## P1 + Crash Recovery — Why Both a globalSetup Reset and Targeted Delete Are Needed
+
+These two mechanisms solve **different problems** and must coexist:
+
+| Mechanism | Runs | Solves |
+|---|---|---|
+| `globalSetup` → `resetMappings` | Once, before any worker spawns | Orphaned stubs from a previous crashed run |
+| `beforeEach`/`afterAll` → `removeMapping(id)` | Per worker, during the run | Concurrent worker interference |
+
+**Without `globalSetup`**: a crashed run leaves orphaned priority-1 stubs in WireMock. The next run's `findMapping` returns the orphaned stub (not the default), so a new override is built on top of it. Over repeated crashes, stubs accumulate and WireMock tie-breaking between equal-priority stubs is undefined.
+
+**Without targeted delete**: `beforeEach` / `afterAll` calling `resetMappings` wipes other workers' stubs mid-test — the original race condition.
+
+**`globalSetup.ts` pattern**:
+```ts
+// Runs once before any worker starts — no concurrent stubs exist yet.
+export default async function globalSetup() {
+  const browser = await chromium.launch()
+  const page = await browser.newPage()
+  try {
+    await page.request.post(`${wiremockAdminUrl}/mappings/reset`)
+  } catch (error) {
+    // Non-fatal: WireMock may not be running for non-mock test runs
+    console.warn('[globalSetup] WireMock reset failed:', error)
+  } finally {
+    await page.close()
+    await browser.close()
+  }
+}
+```
+
+Register it in `playwright.config.ts`:
+```ts
+defineConfig({
+  globalSetup: 'tests/e2e/mock/globalSetup.ts',
+  // ...
+})
+```
+
+---
+
 ## General Rules
 
 | Rule | Reason |
 |------|--------|
-| Never call `resetMappings` / `resetMappingsInHook` in specs | Global wipe breaks concurrent workers |
-| Always capture the `id` from `createMapping` | Required for targeted cleanup |
+| Reset WireMock in `globalSetup`, not in `beforeEach`/`afterAll` | `globalSetup` runs before workers spawn — no concurrent stubs exist yet |
+| Never call `resetMappings` / `resetMappingsInHook` in specs | Global wipe during the run breaks concurrent workers |
+| Always capture the `id` from `createMapping` | Required for targeted cleanup during the run |
 | Delete own stub before calling `findMapping` for the default | WireMock returns highest-priority first; your own override hides the default |
 | Wrap `updateMapping` in try/catch with `createMapping` fallback | Stubs can be wiped between creation and update by concurrent resets |
 | Add language stubs to every spec that opens the editor | Protects against WireMock default data evolving |
