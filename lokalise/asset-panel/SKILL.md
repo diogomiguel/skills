@@ -222,6 +222,81 @@ for (const token of originalTokens) {
 }
 ```
 
+### Slash command — glossary (EXP-1777 patterns)
+
+The glossary slash command (`/term…`) uses a discriminated-union item type and a small React context for cross-cutting callbacks.
+
+**Item type**: split into `kind: 'term'` (real glossary match) and `kind: 'add-new-term'` (no-match sentinel):
+
+```ts
+type GlossarySlashCommandItemData =
+  | (SlashCommandItem & { kind: 'term'; term: GlossaryTerm; translationText: string; onInsert: (postInsertText: string) => void })
+  | (SlashCommandItem & { kind: 'add-new-term'; onAction: () => void })
+```
+
+**No-match sentinel** is appended only when:
+- `query.trim().length > 0` (no sentinel on the empty `/` trigger)
+- `termItems.length === 0` (no real matches)
+- User has `manageWorkspaceAssets` (gate via `useCanPerformAction`)
+
+Use a **two-memo split** so per-keystroke `query` changes don't rebuild term closures:
+```ts
+const termItems = useMemo(() => terms.map(...), [terms, segment.locale, segment.id, ...])
+const items = useMemo(() => /* cheap append of sentinel */, [termItems, query, canManageAssets, ...])
+```
+
+**Double-space dismissal** — `createSlashCommandRenderer.ts` tracks `lastKeyWasSpace` in keydown and dismisses on the second consecutive space; the second space is allowed to land in the document (return `false`). An `onUpdate` fallback checks `query.endsWith('  ')` for paste/IME paths that bypass keydown.
+
+**Disable OS rewrites on the editor** — set `autocorrect="off"`, `autocapitalize="off"`, `spellcheck="false"` via `editorProps.attributes` on the slash plugin. macOS otherwise rewrites `'  '` to `'. '` before the query sees it.
+
+**Inserting an existing term**: `editor.chain().focus().deleteRange(range).insertContent(translationText).run()`. The glossary-term node is **atomic** — without a text serializer, `getText()` drops its content. Use `getSegmentTextWithGlossary(editor)`:
+
+```ts
+export const getSegmentTextWithGlossary = (editor: Editor): string =>
+  editor.getText({
+    textSerializers: { [glossaryTermExtensionName]: ({ node }) => node.attrs.term },
+  })
+```
+
+**Add-new-term path**: `onSelect` deletes the `/query` trigger first (`deleteRange(range).run()`), then calls `item.onAction()` which opens `AddGlossaryTermDialog` prefilled with the trimmed query.
+
+### AddGlossaryTermDialog — prefill + add-another
+
+- Accepts a `prefillTerm?: string` prop. The form builds `formValues = prefillTerm ? { ...defaultFormValues, term: prefillTerm } : defaultFormValues`. Memo it at the caller if the parent re-renders frequently (prevents spurious effect runs inside the form).
+- Add-another flow: after `isSubmitSuccessful && addAnotherTerm`, call `formReset({ ...defaultValues, term: '' })` — the explicit `term: ''` overrides any prefill so the next entry starts empty.
+- The language-Select row should be **derived**, not state-only: `isSelectRowVisible = translations.fields.length === 0 || showSelectOnDemand`. That way a form-reset (which clears `translations`) restores the Select automatically without manually resetting `isSelectRowVisible`.
+
+### Inserting created term back into the segment
+
+After the dialog returns `{ term, options: { addAnother } }`, the caller inserts the new term at the captured cursor. **Re-read selection after each insert** rather than advancing by `text.length` — ProseMirror positions count nodes, and `selection.from` is authoritative:
+
+```ts
+const text = resolveInsertionText(result.term, segment.locale)
+editor.chain().focus().insertContentAt(insertionPosRef.current, text).run()
+insertionPosRef.current = editor.state.selection.from  // NOT += text.length
+```
+
+### Slash command context
+
+Cross-cutting callbacks (open-add-dialog, analytics) flow through a `SlashCommandProvider` wrapping the editor. The provider throws if missing — wrap `<SegmentEditor>` in `<SlashCommandProvider value={...}>` whenever you render edit mode. The provider value MUST be `useMemo`'d; callbacks inside MUST be `useCallback`'d, otherwise the slash-command term items rebuild on every parent render.
+
+### Hoisted modals — suspend editor escape/click-outside
+
+`SegmentContent`'s Escape and click-outside effects suspend when ANY portaled modal is open (discard-confirmation, add-term, etc.). The portals live outside `wrapperRef`, so otherwise the modal's own Escape re-enters `onCancelTriggered` and silently tears down the editor. When adding a new hoisted modal, add an `isXOpen` boolean to both effect dep arrays.
+
+### Glossary insertion analytics
+
+Event: `Glossary Term Inserted`. Shape:
+```ts
+{
+  glossary_term_id: string
+  insertion_method: 'panel' | 'slash_command'
+  segment_id, segment_source_text, segment_translation_text, project_id, language: string
+  task_id: string | null
+}
+```
+The `segment_translation_text` MUST be the post-insertion text, captured via `getSegmentTextWithGlossary(editor)` so atomic glossary nodes are serialized.
+
 ## Testing conventions
 
 See the project's general autopilot test patterns in the repo's own memory/CLAUDE docs. Asset-panel-specific:
@@ -316,4 +391,8 @@ Repo-wide conventions live in `.claude/CLAUDE.md` — follow those. Asset-panel-
 9. **`meta.count` is a TOTAL, not a page count** (per `@lokalise/api-common` docs). Use `data.pages[0]?.meta.count` for count badges; never `.length` of loaded items.
 10. **Review feedback from shipped PRs** (keep applying in future work):
     - Search open + empty query must keep DefaultBrowseState visible (gate on `searchPhrase.trim()`, not just `searchVisible`). Icons inside guidance `<p>` are `inline-block`, not flex children. `usedInProjectTitle` → `usedInWorkspaceTitle`. Counter list has no borders/dividers.
+11. **Atomic-node serialization** — glossary-term nodes render via a custom NodeView; their text is dropped by `editor.getText()` unless you pass a `textSerializers` map keyed by `glossaryTermExtensionName`. Always use the `getSegmentTextWithGlossary(editor)` helper.
+12. **ProseMirror positions ≠ character offsets** — after `insertContentAt(pos, text)`, the next cursor position is *not* `pos + text.length` when atomic nodes are involved. Re-read `editor.state.selection.from` instead.
+13. **OS-level keystroke rewrites in slash-command pickers** — macOS autocorrect can turn `'  '` into `'. '` and smart-quote ASCII quotes. Set `autocorrect="off"`, `autocapitalize="off"`, `spellcheck="false"` on the editor element via `editorProps.attributes` when typing into the slash query.
+14. **`useSlashCommandContext` throws if unprovided** — wrap edit-mode renders in `<SlashCommandProvider>`. New slash commands that don't need glossary context still need to be inside a provider, or refactor the hook to return `null` (currently throws by design — keeps glossary command crash-fast).
     - Count badges must read `meta.count` (server total), not `.length` of loaded items. Infinite queries need pagination wired up (`IntersectionObserver` sentinel) if the list is expected to exceed page size.
